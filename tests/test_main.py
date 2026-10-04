@@ -1,6 +1,12 @@
+import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import aiosqlite
 import pytest
 
 import main
+from core.auth_manager import GCAuthSessionManager
 
 
 @pytest.mark.parametrize(
@@ -19,6 +25,94 @@ def test_bid_cap_never_allows_an_amount_over_the_ai_maximum(
     expected: bool,
 ) -> None:
     assert main._is_bid_within_ai_cap(proposed_bid, suggested_max_bid) is expected
+
+
+@pytest.mark.asyncio
+async def test_watcher_handles_due_fake_listing_without_form_or_post(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.database import init_db, save_listing
+
+    test_db = tmp_path / "watcher_dry_run.db"
+    monkeypatch.setattr("core.database.DB_PATH", test_db)
+    await init_db()
+
+    closing_date = (
+        datetime.now(ZoneInfo("America/Toronto")) + timedelta(seconds=10)
+    ).isoformat(timespec="seconds")
+    await save_listing(
+        {
+            "id": "999999",
+            "title": "Dry-run fake server lot",
+            "category": "Test",
+            "current_bid": 10.0,
+            "minimum_bid": 10.0,
+            "location": "Brossard, QC",
+            "closing_date": closing_date,
+            "url": "https://example.invalid/lot/999999",
+        }
+    )
+    async with aiosqlite.connect(test_db) as db:
+        await db.execute(
+            """
+            UPDATE listings
+            SET is_analyzed = 1, is_viable = 1, suggested_max_bid = 20.0
+            WHERE id = '999999'
+            """
+        )
+        await db.commit()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.post_called = False
+
+        def post(self, *_args, **_kwargs):
+            self.post_called = True
+            raise AssertionError("Dry-run must not submit an HTTP POST")
+
+    session = FakeSession()
+    auth_manager = GCAuthSessionManager()
+
+    async def get_session():
+        return session
+
+    async def fetch_page(_url: str) -> str:
+        return "<html><body>Invalid lot; no auction form.</body></html>"
+
+    auth_manager.get_session = get_session
+    auth_manager.fetch_page = fetch_page
+    monkeypatch.setattr(main, "auth_manager", auth_manager)
+
+    notifications: list[dict[str, object]] = []
+
+    class FakeNotifier:
+        async def notify_snipe_executed(self, **kwargs):
+            notifications.append(kwargs)
+
+    async def allow_bid(_amount: float) -> bool:
+        return True
+
+    async def stop_after_one_cycle(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "discord_notifier", FakeNotifier())
+    monkeypatch.setattr(main, "authorize_bid", allow_bid)
+    monkeypatch.setattr(asyncio, "sleep", stop_after_one_cycle)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.snipe_watcher_worker(poll_interval=0)
+
+    assert session.post_called is False
+    assert len(notifications) == 1
+    assert notifications[0]["status"] == "FAILED"
+    async with aiosqlite.connect(test_db) as db:
+        row = await (
+            await db.execute(
+                "SELECT status FROM active_bids WHERE listing_id = '999999'"
+            )
+        ).fetchone()
+    assert row == ("FAILED",)
 
 
 @pytest.mark.asyncio
