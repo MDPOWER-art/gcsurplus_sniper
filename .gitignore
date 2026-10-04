@@ -1,0 +1,9 @@
+# Fichier .gitignore
+.env
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+dump.html
+.pytest_cache/
